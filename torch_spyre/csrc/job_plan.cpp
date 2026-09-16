@@ -237,8 +237,7 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   }
 
   launch_host_callback([this, addresses](void*) {
-    // Use fast path with all tensor addresses
-    // Returns true if fast path was actually used, false if fell back
+    // Uses fast_plan_ when available; otherwise falls back to the regular path.
     deeptools::processComputeOnHostCommandFast(
         fast_plan_, *hcm_, output_buffer_, addresses.data(), addresses.size());
   });
