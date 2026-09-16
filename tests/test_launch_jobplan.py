@@ -47,8 +47,11 @@ def _zero_symbol_hcm() -> dict:
                         "pre_expand_dcsi_": [],
                         "pre_input_shape_": [],
                         "dcsi_": [],
-                        "input_shape_": [],
-                        # One element per byte: matches the 1024-byte H2D payload.
+                        # hostCorrectionBytes() computes flit_bytes as the product
+                        # of input_shape_, so this must match the 1024-byte payload.
+                        "input_shape_": [1024],
+                        # One element per byte: SymbolSubstituteOutputWords uses
+                        # output_shape_ to size the written output.
                         "output_shape_": [1024],
                         "post_slice_dcsi_": [],
                         "post_output_shape_": [],
@@ -166,7 +169,7 @@ class TestLaunchJobPlan(TestCase):
                     torch_spyre._C.launch_jobplan(job_plan, [])
 
     def test_zero_symbol_host_compute_does_not_raise(self):
-        """A zero-symbol HostCompute step must populate its output buffer."""
+        """A zero-symbol HostCompute step must complete the full 3-step plan."""
         with tempfile.TemporaryDirectory() as tmpdir:
             test_pk = tpk()
             spyrecode_dir = test_pk.create_mock_spyrecode(
@@ -176,14 +179,25 @@ class TestLaunchJobPlan(TestCase):
                     "ohandle": "output_buffer",
                     "size": "1024",
                     "ishape": ["0"],
+                    # oshape mirrors the compiler output (dci.output_shape_).
+                    "oshape": ["1024"],
                     "ihandle": "",
                     "hcm": _zero_symbol_hcm(),
                 },
             )
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            # Verify the plan was constructed with all three expected steps.
+            self.assertEqual(job_plan.num_steps(), 3)
+            self.assertEqual(job_plan.get_step_type(0), "HostCompute")
+            self.assertEqual(job_plan.get_step_type(1), "H2D")
+            self.assertEqual(job_plan.get_step_type(2), "Compute")
+
             stream = torch.Stream("spyre")
             with stream:
                 torch_spyre._C.launch_jobplan(job_plan, [])
+            # The host callback is synchronous, so no exception here means
+            # processComputeOnHostCommand ran to completion.
+            torch.accelerator.synchronize()
 
 
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):
