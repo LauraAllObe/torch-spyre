@@ -79,17 +79,25 @@ def run_test(comm_rank, comm_size, async_op=False, num_elements=128):
     print(f"[{comm_rank} of {comm_size}] {result[:10]} .. {result[-10:]}")
     print(f"  Expected values: {expected_tensor[:10]} .. {expected_tensor[-10:]}")
 
-    # Tolerance: ceil(log2(comm_size)) ULPs of float16 at the maximum expected value.
-    # A binary tree reduction of depth d = ceil(log2(N)) can accumulate up to d
-    # rounding errors, each bounded by 1 ULP at the running partial-sum magnitude.
+    # Tolerance: 1 ULP of float16 at the maximum *chunk* partial-sum magnitude.
+    # dist.all_reduce dispatches to ReduceScatterAllGather: each rank accumulates
+    # only a 1/N slice of the tensor (num_elements/comm_size elements), receiving
+    # one contribution from each rank. The maximum value any rank sums locally is
+    # bounded by comm_size × max_single_element, where max_single_element is the
+    # largest value any rank contributes: (comm_size-1)*num_elements + (num_elements-1).
+    # This is O(N * num_elements) — one factor of N smaller than the full reduce.py
+    # magnitude — so 1 ULP at that scale is the appropriate bound. The allgather
+    # phase that follows is pure data movement and introduces no rounding.
     # ULP of float16 at value v = 2^(floor(log2(v)) - 10).
-    max_expected = float(expected_tensor.max())
-    ulp = 2.0 ** (math.floor(math.log2(max_expected)) - 10)
-    tree_depth = math.ceil(math.log2(comm_size)) if comm_size > 1 else 1
-    atol = tree_depth * ulp
+    # note: This formula assumes ReduceScatterAllGather is selected at runtime.
+    # If a different algorithm is chosen (e.g. BiTreeBcast, GatherSumBcast), the
+    # error model changes and this tolerance may need revisiting.
+    max_single_element = float((comm_size - 1) * num_elements + (num_elements - 1))
+    chunk_max = comm_size * max_single_element
+    atol = 2.0 ** (math.floor(math.log2(chunk_max)) - 10)
     print(
         f"  Tolerance: atol={atol} "
-        f"({tree_depth} ULP(s) of float16 at max expected {max_expected})"
+        f"(1 ULP of float16 at chunk max {chunk_max}, algo=ReduceScatterAllGather assumed)"
     )
 
     if torch.allclose(result, expected_tensor, atol=atol, rtol=0.0):
