@@ -191,12 +191,12 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     return;
   }
 
-  // Case 2: zero host-supplied symbols (ishape_ == {0})
-  // nullptr is the documented zero-symbol input — DataConvertInfoGenerate
-  // branches on it (DataConvertInfoGenerate.cpp:148) and runs with an empty
-  // symbol set. output_buffer_ must still be filled before the H2D DMA.
+  // Case 2: fake symbols (ishape_ is {0})
+  // Further discussion is required on "ishape". For now, it's vector<int64_t>,
+  // and it's {0}, it's for fake symbols
   if (ishape_.size() == 1 && ishape_[0] == 0) {
     launch_host_callback([this](void*) {
+      // Fake symbols don't need fast path - use regular path
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, nullptr);
     });
     return;
@@ -237,8 +237,9 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   }
 
   launch_host_callback([this, addresses](void*) {
-    // Uses fast_plan_ when available; otherwise falls back to the regular path.
-    deeptools::processComputeOnHostCommandFast(
+    // Use fast path with all tensor addresses
+    // Returns true if fast path was actually used, false if fell back
+    bool used_fast_path = deeptools::processComputeOnHostCommandFast(
         fast_plan_, *hcm_, output_buffer_, addresses.data(), addresses.size());
   });
 }
