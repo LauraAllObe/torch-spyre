@@ -116,20 +116,20 @@ class TestLaunchJobPlan(TestCase):
                     torch_spyre._C.launch_jobplan(job_plan, [])
 
 
-    def test_zero_symbol_host_compute_prepares(self):
-        """Zero-symbol HostCompute (ishape=["0"]) is accepted by prepare_kernel
-        and produces a HostCompute step with a valid flex::HostComputeHandle.
+    def test_zero_symbol_host_compute_executes(self):
+        """Zero-symbol HostCompute (ishape=["0"]) executes without raising.
 
         The existing test_invalid_hcm_metadata_surfaces_on_synchronize covers
-        the error path (broken HCM + ishape=["0"] raises at launch time).
-        This test covers the success path at prepare time: a valid minimal HCM
-        with ishape=["0"] must parse through flex::createHostComputeHandle
-        without raising, and the resulting plan must contain a HostCompute step.
+        the error path: broken HCM + ishape=["0"] raises at launch_jobplan time.
+        This test covers the success path: a valid minimal HCM with ishape=["0"]
+        must traverse the full construct() -> flex::createHostComputeParams path
+        and complete cleanly.
 
-        prepare_kernel is the correct boundary to test here — it calls
-        flex::createHostComputeHandle which builds the FastHcmPatchPlan eagerly.
-        launch_jobplan is intentionally not called: the mock binary is not a
-        valid AIU program and would fault the device on ComputeOnDevice.
+        ComputeOnDevice is intentionally omitted from the plan — the plan parser
+        does not require it, and a HostCompute + H2D plan is self-contained.
+        This avoids executing a mock binary on hardware (which would fault the
+        device) while still calling launch_jobplan and driving the real
+        host-compute execution path through flex.
 
         The HCM is minimal but valid: a single SYMBOL_SUBSTITUTE dci with
         output_shape_=[0] produces zero output bytes, so the senConstants
@@ -183,29 +183,41 @@ class TestLaunchJobPlan(TestCase):
                 # so ConstExec copies nothing and no bytes are written.
                 "senConstants": [{"senconst_": ""}, {"senconst_": ""}],
             }
-            exec_properties = {
-                "ohandle": "output_buffer",
-                "size": "1024",
-                "ishape": ["0"],
-                "ihandle": "",
-                "hcm": hcm,
-            }
+            # HostCompute + H2D only — ComputeOnDevice intentionally omitted
+            # so no mock binary is executed on hardware.
+            job_exec_plan = [
+                {
+                    "command": "ComputeOnHost",
+                    "properties": {
+                        "ohandle": "output_buffer",
+                        "size": "1024",
+                        "ishape": ["0"],
+                        "ihandle": "",
+                        "hcm": hcm,
+                    },
+                },
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "false",
+                        "host_handle": "output_buffer",
+                        "dev_ptr": "120259084288",
+                        "size": "1024",
+                    },
+                },
+            ]
             test_pk = tpk()
             spyrecode_dir = test_pk.create_mock_spyrecode(
-                tmpdir,
-                exec_command="ComputeOnHost",
-                exec_properties=exec_properties,
+                tmpdir, job_exec_plan=job_exec_plan
             )
-
-            # prepare_kernel must not raise: flex::createHostComputeHandle
-            # builds the FastHcmPatchPlan eagerly at prepare time, so a
-            # malformed HCM would raise here rather than at launch time.
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            stream = torch.Stream("spyre")
 
-            # The plan must contain a HostCompute step — confirms the
-            # zero-symbol path was parsed and handled, not silently skipped.
-            assert job_plan.num_steps() >= 1
-            assert job_plan.get_step_type(0) == "HostCompute"
+            # launch_jobplan must complete without raising: the zero-symbol
+            # HostCompute step runs synchronously via flex::createHostComputeParams,
+            # then the H2D is enqueued. No device compute is executed.
+            with stream:
+                torch_spyre._C.launch_jobplan(job_plan, [])
 
 
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):
