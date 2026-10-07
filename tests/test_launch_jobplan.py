@@ -116,107 +116,96 @@ class TestLaunchJobPlan(TestCase):
                     torch_spyre._C.launch_jobplan(job_plan, [])
 
 
-    def test_zero_symbol_host_compute_executes(self):
-        """Zero-symbol HostCompute (ishape=["0"]) executes the nullptr branch
-        in flex::HostComputeHandle without raising.
+    def test_zero_symbol_host_compute_prepares(self):
+        """Zero-symbol HostCompute (ishape=["0"]) is accepted by prepare_kernel
+        and produces a HostCompute step with a valid flex::HostComputeHandle.
 
         The existing test_invalid_hcm_metadata_surfaces_on_synchronize covers
-        the error path (broken HCM, ishape=["0"]).  This test covers the
-        success path: a valid minimal HCM with ishape=["0"] must traverse
-        the full construct() -> flex::createHostComputeParams path and complete
-        without error.
+        the error path (broken HCM + ishape=["0"] raises at launch time).
+        This test covers the success path at prepare time: a valid minimal HCM
+        with ishape=["0"] must parse through flex::createHostComputeHandle
+        without raising, and the resulting plan must contain a HostCompute step.
+
+        prepare_kernel is the correct boundary to test here — it calls
+        flex::createHostComputeHandle which builds the FastHcmPatchPlan eagerly.
+        launch_jobplan is intentionally not called: the mock binary is not a
+        valid AIU program and would fault the device on ComputeOnDevice.
 
         The HCM is minimal but valid: a single SYMBOL_SUBSTITUTE dci with
         output_shape_=[0] produces zero output bytes, so the senConstants
-        payload is empty and the bounds check always passes.  No symbols are
-        needed because the zero-symbol branch skips address resolution
-        entirely — this is the unique integration path not covered by flex's
-        own unit tests (which test processComputeOnHostCommand directly, not
-        the torch-spyre -> flex::createHostComputeParams wiring).
+        payload is empty and the bounds check always passes. No symbols are
+        needed because the zero-symbol branch skips address resolution entirely.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
-            job_exec_plan = [
-                {
-                    "command": "ComputeOnHost",
-                    "properties": {
-                        "ohandle": "output_buffer",
-                        "size": "1024",
-                        "ishape": ["0"],
-                        "ihandle": "",
-                        "hcm": {
-                            "vdci": {
+            hcm = {
+                "vdci": {
+                    "dsName_": "zero_symbol",
+                    "isMarker_": 0,
+                    "data_conversion_info_group_": [
+                        {
+                            "key": [],
+                            "dci": {
                                 "dsName_": "zero_symbol",
-                                "isMarker_": 0,
-                                "data_conversion_info_group_": [
-                                    {
-                                        "key": [],
-                                        "dci": {
-                                            "dsName_": "zero_symbol",
-                                            "isHostToSen_": 1,
-                                            "dataformat_src_": 8,
-                                            "dataformat_dst_": 8,
-                                            "dcOpName_": 6,
-                                            "pre_expand_dcsi_": [],
-                                            "pre_input_shape_": [],
-                                            "dcsi_": [],
-                                            "input_shape_": [],
-                                            "output_shape_": [0],
-                                            "post_slice_dcsi_": [],
-                                            "post_output_shape_": [],
-                                            "input_dimwise_ea_": [],
-                                            "output_dimwise_ea_": [],
-                                            "useSpi_": 0,
-                                            "usePca_": 0,
-                                            "usePadVal_": 0,
-                                            "inputPadVal_": 0,
-                                            "useWli_": 0,
-                                            "dmdi_": {"perTensorInfo": []},
-                                            "ssi_": {
-                                                "value_and_locs_": [],
-                                                "inputSym_": [],
-                                                "unSubstitutedFlitStartOffset_": 0,
-                                            },
-                                        },
-                                    }
-                                ],
-                                "group_tags_": [],
-                                "inputSym_": [],
-                                "dciIdxSym_": [],
-                                "variableDefs_": [],
+                                "isHostToSen_": 1,
+                                "dataformat_src_": 8,
+                                "dataformat_dst_": 8,
+                                "dcOpName_": 6,
+                                "pre_expand_dcsi_": [],
+                                "pre_input_shape_": [],
+                                "dcsi_": [],
+                                "input_shape_": [],
+                                "output_shape_": [0],
+                                "post_slice_dcsi_": [],
+                                "post_output_shape_": [],
+                                "input_dimwise_ea_": [],
+                                "output_dimwise_ea_": [],
+                                "useSpi_": 0,
+                                "usePca_": 0,
+                                "usePadVal_": 0,
+                                "inputPadVal_": 0,
+                                "useWli_": 0,
+                                "dmdi_": {"perTensorInfo": []},
+                                "ssi_": {
+                                    "value_and_locs_": [],
+                                    "inputSym_": [],
+                                    "unSubstitutedFlitStartOffset_": 0,
+                                },
                             },
-                            # Two senConstants required by processComputeOnHostCommand
-                            # (payload + trailer). Both empty: sizeInBytes() == 0,
-                            # so ConstExec copies nothing and no bytes are written.
-                            "senConstants": [{"senconst_": ""}, {"senconst_": ""}],
-                        },
-                    },
+                        }
+                    ],
+                    "group_tags_": [],
+                    "inputSym_": [],
+                    "dciIdxSym_": [],
+                    "variableDefs_": [],
                 },
-                {
-                    "command": "DataTransfer",
-                    "properties": {
-                        "dirn": "false",
-                        "host_handle": "output_buffer",
-                        "dev_ptr": "120259084288",
-                        "size": "1024",
-                    },
-                },
-                {
-                    "command": "ComputeOnDevice",
-                    "properties": {"job_bin_ptr": "120259084288"},
-                },
-            ]
+                # Two senConstants required by processComputeOnHostCommand
+                # (payload + trailer). Both empty: sizeInBytes() == 0,
+                # so ConstExec copies nothing and no bytes are written.
+                "senConstants": [{"senconst_": ""}, {"senconst_": ""}],
+            }
+            exec_properties = {
+                "ohandle": "output_buffer",
+                "size": "1024",
+                "ishape": ["0"],
+                "ihandle": "",
+                "hcm": hcm,
+            }
             test_pk = tpk()
             spyrecode_dir = test_pk.create_mock_spyrecode(
-                tmpdir, job_exec_plan=job_exec_plan
+                tmpdir,
+                exec_command="ComputeOnHost",
+                exec_properties=exec_properties,
             )
-            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
-            stream = torch.Stream("spyre")
 
-            # launch_jobplan must not raise: the zero-symbol HostCompute step
-            # completes via flex::createHostComputeParams before the H2D and
-            # device Compute are enqueued on the stream.
-            with stream:
-                torch_spyre._C.launch_jobplan(job_plan, [])
+            # prepare_kernel must not raise: flex::createHostComputeHandle
+            # builds the FastHcmPatchPlan eagerly at prepare time, so a
+            # malformed HCM would raise here rather than at launch time.
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            # The plan must contain a HostCompute step — confirms the
+            # zero-symbol path was parsed and handled, not silently skipped.
+            assert job_plan.num_steps() >= 1
+            assert job_plan.get_step_type(0) == "HostCompute"
 
 
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):
