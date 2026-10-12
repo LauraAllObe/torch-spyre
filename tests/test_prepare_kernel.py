@@ -912,7 +912,6 @@ class TestPrepareKernel:
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_pipeline_barrier(999)
 
-
     def test_dev_only_plan_has_all_dev_roles(self):
         """A pure ComputeOnDevice plan assigns Dev role to every step.
 
