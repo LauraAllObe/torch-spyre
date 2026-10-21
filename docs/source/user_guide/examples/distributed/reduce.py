@@ -13,104 +13,395 @@
 # limitations under the License.
 import argparse
 import math
+import os
+from typing import Tuple
 import torch
 import torch.distributed as dist
-import os
 
 DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
 
-def run_test(comm_rank, comm_size, async_op=False, num_elements=128):
-    """Run a reduce test where all ranks contribute and root receives the sum.
+def calculate_reduce_tolerance(comm_size: int, max_expected: float) -> float:
+    """Calculate self-calibrating tolerance for binary tree reduction.
+
+    A balanced binary tree reduction (COMPUTE_TREE in spyre-comms) has depth
+    d = ceil(log2(N)). Each level introduces at most 1 ULP of float16 rounding
+    error at the running partial-sum magnitude.
+    ULP of float16 at value v is 2^(floor(log2(v)) - 10).
 
     Args:
-        comm_rank: Rank of the current process
-        comm_size: Total number of processes
-        async_op: If True, launch the collective asynchronously and overlap CPU
-                  work with the hardware operation before calling work.wait().
-        num_elements: Number of elements per rank tensor. Reduce this to lower
-                      the peak float16 magnitude when testing at large world sizes.
+        comm_size: Total number of ranks (world size)
+        max_expected: Maximum expected value in the reduced tensor
+
+    Returns:
+        atol: Absolute tolerance scaled by tree depth and float16 ULP
     """
-    global DEVICE
+    if max_expected <= 0.0:
+        return 0.0
+    tree_depth = math.ceil(math.log2(comm_size)) if comm_size > 1 else 1
+    ulp = 2.0 ** (math.floor(math.log2(max_expected)) - 10)
+    return tree_depth * ulp
 
-    # Create contiguous range for this rank: rank 0 gets [0..num_elements-1],
-    # rank 1 gets [num_elements..2*num_elements-1], etc.
-    start_value = comm_rank * num_elements
-    end_value = start_value + num_elements
-    input_tensor = torch.arange(start_value, end_value, dtype=torch.float16)
 
-    print("-" * 70)
-    print(
-        f"[{comm_rank} of {comm_size}] Input Tensor (Before Reduce): {input_tensor.shape}"
-    )
-    print(f"[{comm_rank} of {comm_size}] {input_tensor[:10]} .. {input_tensor[-10:]}")
+def check_close(
+    result: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float = 0.0,
+    rtol: float = 0.0,
+    test_id: str = "",
+    comm_rank: int = 0,
+    comm_size: int = 1,
+):
+    """Check whether result matches expected tensor within tolerance.
 
-    # Send input tensor to Spyre device
+    Inspired by verification utilities in torch_nnpa/tests (e.g. check_close with
+    explicit rtol=0.0, atol=0.0 for exact invariants vs calibrated tolerance).
+
+    Args:
+        result: Output tensor from device (on CPU)
+        expected: Golden expected tensor on CPU
+        atol: Absolute tolerance (0.0 for exact tests)
+        rtol: Relative tolerance (0.0 for exact tests)
+        test_id: Identifier of the test case (e.g. 'EXACT_ZEROS_1D')
+        comm_rank: Current process rank
+        comm_size: Total world size
+    """
+    if result.shape != expected.shape:
+        raise RuntimeError(
+            f"[{comm_rank} of {comm_size}] [{test_id}] Shape mismatch: "
+            f"got {result.shape} vs expected {expected.shape}"
+        )
+
+    if result.dtype != expected.dtype:
+        raise RuntimeError(
+            f"[{comm_rank} of {comm_size}] [{test_id}] Dtype mismatch: "
+            f"got {result.dtype} vs expected {expected.dtype}"
+        )
+
+    is_close = torch.allclose(result, expected, atol=atol, rtol=rtol)
+    diff = (result.float() - expected.float()).abs()
+    max_diff = float(diff.max())
+    arg_max = int(diff.argmax())
+
+    flat_expected = expected.flatten()
+    flat_result = result.flatten()
+
+    if is_close:
+        tol_str = (
+            "exact (atol=0, rtol=0)"
+            if (atol == 0.0 and rtol == 0.0)
+            else f"atol={atol:.4f}, rtol={rtol}"
+        )
+        print(
+            f"[{comm_rank} of {comm_size}] [{test_id:<28}] PASS "
+            f"(shape={str(list(result.shape)):<12} max_diff={max_diff:.6f}, tol={tol_str})"
+        )
+    else:
+        raise RuntimeError(
+            f"[{comm_rank} of {comm_size}] [{test_id}] FAILED:\n"
+            f"  Shape:    {result.shape}, Dtype: {result.dtype}\n"
+            f"  Expected: {flat_expected[:8]} .. {flat_expected[-8:]}\n"
+            f"  Got:      {flat_result[:8]} .. {flat_result[-8:]}\n"
+            f"  Max absolute difference: {max_diff} at flat index {arg_max} "
+            f"(expected {float(flat_expected[arg_max])}, got {float(flat_result[arg_max])})\n"
+            f"  Allowed tolerance: atol={atol}, rtol={rtol}"
+        )
+
+
+def verify_negative_rejection(
+    result: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float,
+    test_id: str,
+    comm_rank: int,
+):
+    """Verify that assertion logic correctly rejects corrupted outputs (negative test).
+
+    Ensures the test suite does not produce false passes when outputs violate
+    numerical bounds.
+    """
+    corrupted = result.clone().flatten()
+    flat_expected = expected.flatten()
+    perturbation = (atol + 1.0) if atol > 0.0 else 1.0
+    corrupted[0] += perturbation
+    is_rejected = not torch.allclose(corrupted, flat_expected, atol=atol, rtol=0.0)
+    if not is_rejected:
+        raise RuntimeError(
+            f"[{comm_rank}] [{test_id}] Negative validation failed: corrupted output was not rejected!"
+        )
+
+
+def generate_test_tensors(
+    test_spec: dict, comm_rank: int, comm_size: int
+) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """Generate input and golden expected tensors for a given parametrized test specification.
+
+    Follows the comprehensive test matrix patterns used in torch_nnpa/tests/test_matmul.py
+    covering small, medium, large, multidimensional (1D, 2D, 3D), exact invariants,
+    and calibrated dynamic ranges.
+    """
+    shape = test_spec["shape"]
+    pattern = test_spec["pattern"]
+    num_elements = int(torch.prod(torch.tensor(shape)).item())
+
+    if pattern == "zeros":
+        input_tensor = torch.zeros(shape, dtype=torch.float16)
+        expected_tensor = (
+            torch.zeros(shape, dtype=torch.float16) if comm_rank == 0 else None
+        )
+        atol = 0.0
+
+    elif pattern == "ones":
+        input_tensor = torch.ones(shape, dtype=torch.float16)
+        expected_tensor = (
+            torch.full(shape, float(comm_size), dtype=torch.float16)
+            if comm_rank == 0
+            else None
+        )
+        atol = 0.0
+
+    elif pattern == "uniform_constant":
+        const_val = float(test_spec.get("value", 4.0))
+        input_tensor = torch.full(shape, const_val, dtype=torch.float16)
+        expected_tensor = (
+            torch.full(shape, const_val * comm_size, dtype=torch.float16)
+            if comm_rank == 0
+            else None
+        )
+        atol = 0.0
+
+    elif pattern == "powers_of_two":
+        # Rank r sends 2^(r % 4). Sum over all ranks is exact integer power representation in fp16
+        rank_val = float(2 ** (comm_rank % 4))
+        input_tensor = torch.full(shape, rank_val, dtype=torch.float16)
+        if comm_rank == 0:
+            total_sum = sum(float(2 ** (r % 4)) for r in range(comm_size))
+            expected_tensor = torch.full(shape, total_sum, dtype=torch.float16)
+        else:
+            expected_tensor = None
+        atol = 0.0
+
+    elif pattern == "single_rank":
+        # Impulse: Only rank 0 contributes non-zero values, others contribute 0.0
+        if comm_rank == 0:
+            input_tensor = torch.arange(
+                1, num_elements + 1, dtype=torch.float16
+            ).reshape(shape)
+            expected_tensor = input_tensor.clone()
+        else:
+            input_tensor = torch.zeros(shape, dtype=torch.float16)
+            expected_tensor = None
+        atol = 0.0
+
+    elif pattern == "cancellation":
+        # Even ranks send +2.0, odd ranks send -2.0 (exact zero cancellation on even world sizes)
+        sign = 1.0 if (comm_rank % 2 == 0) else -1.0
+        input_tensor = torch.full(shape, sign * 2.0, dtype=torch.float16)
+        if comm_rank == 0:
+            expected_val = 0.0 if (comm_size % 2 == 0) else 2.0
+            expected_tensor = torch.full(shape, expected_val, dtype=torch.float16)
+        else:
+            expected_tensor = None
+        atol = 0.0
+
+    elif pattern == "range":
+        start_value = comm_rank * num_elements
+        end_value = start_value + num_elements
+        input_tensor = torch.arange(
+            start_value, end_value, dtype=torch.float16
+        ).reshape(shape)
+        if comm_rank == 0:
+            flat_expected = torch.zeros(num_elements, dtype=torch.float16)
+            for i in range(num_elements):
+                flat_expected[i] = (
+                    i * comm_size + num_elements * comm_size * (comm_size - 1) / 2
+                )
+            expected_tensor = flat_expected.reshape(shape)
+            max_expected = float(expected_tensor.max())
+            atol = calculate_reduce_tolerance(comm_size, max_expected)
+        else:
+            expected_tensor = None
+            atol = 0.0
+    else:
+        raise ValueError(f"Unknown test pattern: {pattern}")
+
+    return input_tensor, expected_tensor, atol
+
+
+def execute_reduce_step(
+    input_tensor: torch.Tensor, comm_rank: int, async_op: bool = False
+):
+    """Execute a single reduce collective across all ranks."""
     input_device = input_tensor.to(DEVICE)
-
-    expected_tensor = None
-    if comm_rank == 0:
-        # Expected result: sum of all ranks' contributions at each position
-        # Position i gets: (0*num_elements + i) + (1*num_elements + i) + ... + ((comm_size-1)*num_elements + i)
-        # = i*comm_size + num_elements*(0 + 1 + ... + (comm_size-1))
-        # = i*comm_size + num_elements*comm_size*(comm_size-1)/2
-        expected_tensor = torch.zeros(num_elements, dtype=torch.float16)
-        for i in range(num_elements):
-            expected_tensor[i] = (
-                i * comm_size + num_elements * comm_size * (comm_size - 1) / 2
-            )
-
     if async_op:
-        # Launch reduce asynchronously — returns a Work handle immediately
-        print(f"[{comm_rank} of {comm_size}] Reduce Tensor (SUM, async): Spyre")
         work = dist.reduce(input_device, dst=0, op=dist.ReduceOp.SUM, async_op=True)
-
-        # Note: Opportunity for overlapping of host activities with asynchronous communication.
-
-        # Block until the async collective has completed
         work.wait()
     else:
-        # Reduce with the collective library (SUM operation to root rank 0)
-        print(f"[{comm_rank} of {comm_size}] Reduce Tensor (SUM): Spyre")
         dist.reduce(input_device, dst=0, op=dist.ReduceOp.SUM)
+    return input_device.to("cpu") if comm_rank == 0 else None
 
-    # Check the result at root
-    if comm_rank == 0:
-        result = input_device.to("cpu")
-        print(
-            f"[{comm_rank} of {comm_size}] Reduced Tensor at root (SUM of all ranks):"
+
+def get_test_matrix(num_elements: int = 128) -> list:
+    """Return the structured test case matrix inspired by torch_nnpa/tests."""
+    return [
+        # --- Exact Invariant Test Cases (atol=0.0, rtol=0.0) ---
+        {
+            "id": "EXACT_ZEROS_1D",
+            "shape": (num_elements,),
+            "pattern": "zeros",
+            "category": "exact",
+        },
+        {
+            "id": "EXACT_ZEROS_2D",
+            "shape": (16, max(1, num_elements // 16)),
+            "pattern": "zeros",
+            "category": "exact",
+        },
+        {
+            "id": "EXACT_ONES_1D_SMALL",
+            "shape": (16,),
+            "pattern": "ones",
+            "category": "exact",
+        },
+        {
+            "id": "EXACT_ONES_1D_MEDIUM",
+            "shape": (num_elements,),
+            "pattern": "ones",
+            "category": "exact",
+        },
+        {
+            "id": "EXACT_ONES_2D",
+            "shape": (16, max(1, num_elements // 16)),
+            "pattern": "ones",
+            "category": "exact",
+        },
+        {
+            "id": "EXACT_ONES_3D",
+            "shape": (4, 4, max(1, num_elements // 16)),
+            "pattern": "ones",
+            "category": "exact",
+        },
+        {
+            "id": "EXACT_POWERS_OF_TWO",
+            "shape": (num_elements,),
+            "pattern": "powers_of_two",
+            "category": "exact",
+        },
+        {
+            "id": "EXACT_SINGLE_RANK_IMPULSE",
+            "shape": (num_elements,),
+            "pattern": "single_rank",
+            "category": "exact",
+        },
+        {
+            "id": "EXACT_SIGN_CANCELLATION",
+            "shape": (num_elements,),
+            "pattern": "cancellation",
+            "category": "exact",
+        },
+        {
+            "id": "EXACT_UNIFORM_CONSTANT",
+            "shape": (num_elements,),
+            "pattern": "uniform_constant",
+            "value": 4.0,
+            "category": "exact",
+        },
+        # --- Calibrated Tree Tolerance Test Cases (atol = depth * ULP) ---
+        {
+            "id": "TOLERANCE_RANGE_SMALL",
+            "shape": (16,),
+            "pattern": "range",
+            "category": "tolerance",
+        },
+        {
+            "id": "TOLERANCE_RANGE_MEDIUM",
+            "shape": (num_elements,),
+            "pattern": "range",
+            "category": "tolerance",
+        },
+        {
+            "id": "TOLERANCE_RANGE_2D",
+            "shape": (16, max(1, num_elements // 16)),
+            "pattern": "range",
+            "category": "tolerance",
+        },
+        {
+            "id": "TOLERANCE_RANGE_3D",
+            "shape": (4, 4, max(1, num_elements // 16)),
+            "pattern": "range",
+            "category": "tolerance",
+        },
+    ]
+
+
+def run_test(comm_rank, comm_size, async_op=False, num_elements=128, test_case="all"):
+    """Run reduce test matrix with exact invariant and tolerance verification."""
+    global DEVICE
+
+    print("=" * 80)
+    print(
+        f"[{comm_rank} of {comm_size}] Running Reduce Parametrized Test Suite "
+        f"(elements={num_elements}, async={async_op}, filter='{test_case}')"
+    )
+    print("=" * 80)
+
+    test_matrix = get_test_matrix(num_elements)
+    passed_count = 0
+    total_count = 0
+
+    for test_spec in test_matrix:
+        test_id = test_spec["id"]
+        category = test_spec.get("category", "")
+
+        # Filter by test_case name or category
+        if test_case != "all" and test_case not in (
+            test_id,
+            category,
+            test_spec["pattern"],
+        ):
+            continue
+
+        total_count += 1
+        input_tensor, expected_tensor, atol = generate_test_tensors(
+            test_spec, comm_rank, comm_size
         )
-        print(f"[{comm_rank} of {comm_size}] {result[:10]} .. {result[-10:]}")
-        print(f"  Expected values: {expected_tensor[:10]} .. {expected_tensor[-10:]}")
 
-        # Tolerance: ceil(log2(comm_size)) ULPs of float16 at the maximum expected value.
-        # A binary tree reduction of depth d = ceil(log2(N)) can accumulate up to d
-        # rounding errors, each bounded by 1 ULP at the running partial-sum magnitude.
-        # ULP of float16 at value v = 2^(floor(log2(v)) - 10).
-        max_expected = float(expected_tensor.max())
-        ulp = 2.0 ** (math.floor(math.log2(max_expected)) - 10)
-        tree_depth = math.ceil(math.log2(comm_size)) if comm_size > 1 else 1
-        atol = tree_depth * ulp
-        print(
-            f"  Tolerance: atol={atol} "
-            f"({tree_depth} ULP(s) of float16 at max expected {max_expected})"
-        )
+        result = execute_reduce_step(input_tensor, comm_rank, async_op=async_op)
 
-        if torch.allclose(result, expected_tensor, atol=atol, rtol=0.0):
-            print(f"[{comm_rank} of {comm_size}] Reduced tensor is correct")
-        else:
-            raise RuntimeError(
-                f"[{comm_rank} of {comm_size}] Reduced tensor is incorrect: "
-                f"expected {expected_tensor[:10]} but got {result[:10]}"
+        if comm_rank == 0:
+            check_close(
+                result,
+                expected_tensor,
+                atol=atol,
+                rtol=0.0,
+                test_id=test_id,
+                comm_rank=comm_rank,
+                comm_size=comm_size,
             )
-    else:
-        mode = " (async, input consumed)" if async_op else " (input consumed)"
-        print(f"[{comm_rank} of {comm_size}] Non-root rank completed reduce{mode}")
+            # Perform negative validation on root
+            verify_negative_rejection(
+                result, expected_tensor, atol=atol, test_id=test_id, comm_rank=comm_rank
+            )
+            passed_count += 1
+        else:
+            mode = " (async)" if async_op else ""
+            print(
+                f"[{comm_rank} of {comm_size}] [{test_id:<28}] Non-root rank completed{mode}"
+            )
+            passed_count += 1
+
+    print("=" * 80)
+    print(
+        f"[{comm_rank} of {comm_size}] Summary: {passed_count}/{total_count} test cases passed."
+    )
+    print("=" * 80)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Distributed reduce example")
+    parser = argparse.ArgumentParser(
+        description="Distributed reduce example with exact and tolerance checks"
+    )
     parser.add_argument(
         "--async",
         dest="async_op",
@@ -123,10 +414,14 @@ if __name__ == "__main__":
         dest="num_elements",
         type=int,
         default=128,
-        help=(
-            "Number of elements per rank tensor (default: 128). "
-            "Reduce this to lower peak float16 magnitude at large world sizes."
-        ),
+        help="Number of elements per rank tensor (default: 128)",
+    )
+    parser.add_argument(
+        "--test-case",
+        dest="test_case",
+        type=str,
+        default="all",
+        help="Specific test case ID, category ('exact', 'tolerance'), pattern ('zeros', 'ones', 'range'), or 'all'",
     )
     args = parser.parse_args()
 
@@ -139,13 +434,18 @@ if __name__ == "__main__":
         )
 
     # Initialize the distributed environment
-    # Add 'cpu:gloo' since we want to use the backend as well
     print("# Initialize Distributed Group ")
     dist.init_process_group(f"cpu:gloo,spyre:{C10D_BACKEND}")
 
     comm_size = dist.get_world_size()
     comm_rank = dist.get_rank()
 
-    run_test(comm_rank, comm_size, async_op=args.async_op, num_elements=args.num_elements)
+    run_test(
+        comm_rank,
+        comm_size,
+        async_op=args.async_op,
+        num_elements=args.num_elements,
+        test_case=args.test_case,
+    )
 
     dist.destroy_process_group()
