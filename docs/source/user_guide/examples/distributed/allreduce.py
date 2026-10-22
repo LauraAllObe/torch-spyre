@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+from datetime import timedelta
 import math
 import os
 from typing import Tuple
@@ -417,7 +418,10 @@ if __name__ == "__main__":
 
     # Initialize the distributed environment
     print("# Initialize Distributed Group ")
-    dist.init_process_group(f"cpu:gloo,spyre:{C10D_BACKEND}")
+    dist.init_process_group(
+        f"cpu:gloo,spyre:{C10D_BACKEND}",
+        timeout=timedelta(seconds=120),
+    )
 
     comm_size = dist.get_world_size()
     comm_rank = dist.get_rank()
