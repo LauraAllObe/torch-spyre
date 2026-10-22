@@ -225,66 +225,73 @@ def execute_allreduce_step(input_tensor: torch.Tensor, async_op: bool = False):
 
 
 def get_test_matrix(num_elements: int = 128) -> list:
-    """Return the structured test case matrix"""
+    """Return the structured test case matrix inspired by torch_nnpa/tests."""
+    # Hardware constraints: minimum DMA transfer size = 128 bytes (64 float16 elements).
+    # Multi-dimensional splitting requires inner dimension aligned to stick boundary (64 elements).
+    inner_dim = 64
+    rows_2d = max(2, num_elements // inner_dim)
+    d1_3d = 2
+    d2_3d = max(2, num_elements // (d1_3d * inner_dim))
+
     return [
         # --- Exact Invariant Test Cases (atol=0.0, rtol=0.0) ---
         {
             "id": "EXACT_ZEROS_1D",
-            "shape": (num_elements,),
+            "shape": (max(64, num_elements),),
             "pattern": "zeros",
             "category": "exact",
         },
         {
             "id": "EXACT_ZEROS_2D",
-            "shape": (16, max(1, num_elements // 16)),
+            "shape": (rows_2d, inner_dim),
             "pattern": "zeros",
             "category": "exact",
         },
         {
             "id": "EXACT_ONES_1D_SMALL",
-            "shape": (16,),
+            "shape": (64,),
             "pattern": "ones",
             "category": "exact",
         },
         {
             "id": "EXACT_ONES_1D_MEDIUM",
-            "shape": (num_elements,),
+            "shape": (max(64, num_elements),),
             "pattern": "ones",
             "category": "exact",
         },
         {
             "id": "EXACT_ONES_2D",
-            "shape": (16, max(1, num_elements // 16)),
+            "shape": (rows_2d, inner_dim),
             "pattern": "ones",
             "category": "exact",
         },
         {
             "id": "EXACT_ONES_3D",
-            "shape": (4, 4, max(1, num_elements // 16)),
+            "shape": (d1_3d, d2_3d, inner_dim),
             "pattern": "ones",
             "category": "exact",
         },
         {
             "id": "EXACT_POWERS_OF_TWO",
-            "shape": (num_elements,),
+            "shape": (max(64, num_elements),),
             "pattern": "powers_of_two",
             "category": "exact",
         },
         {
             "id": "EXACT_SINGLE_RANK_IMPULSE",
-            "shape": (num_elements,),
+            "shape": (max(64, num_elements),),
             "pattern": "single_rank",
             "category": "exact",
         },
         {
             "id": "EXACT_SIGN_CANCELLATION",
-            "shape": (num_elements,),
+            "shape": (max(64, num_elements),),
             "pattern": "cancellation",
             "category": "exact",
         },
         {
             "id": "EXACT_UNIFORM_CONSTANT",
-            "shape": (num_elements,),
+            "shape": (max(64, num_elements),),
             "pattern": "uniform_constant",
             "value": 4.0,
             "category": "exact",
@@ -292,25 +299,25 @@ def get_test_matrix(num_elements: int = 128) -> list:
         # --- Calibrated Tree Tolerance Test Cases (atol = depth * ULP) ---
         {
             "id": "TOLERANCE_RANGE_SMALL",
-            "shape": (16,),
+            "shape": (64,),
             "pattern": "range",
             "category": "tolerance",
         },
         {
             "id": "TOLERANCE_RANGE_MEDIUM",
-            "shape": (num_elements,),
+            "shape": (max(64, num_elements),),
             "pattern": "range",
             "category": "tolerance",
         },
         {
             "id": "TOLERANCE_RANGE_2D",
-            "shape": (16, max(1, num_elements // 16)),
+            "shape": (rows_2d, inner_dim),
             "pattern": "range",
             "category": "tolerance",
         },
         {
             "id": "TOLERANCE_RANGE_3D",
-            "shape": (4, 4, max(1, num_elements // 16)),
+            "shape": (d1_3d, d2_3d, inner_dim),
             "pattern": "range",
             "category": "tolerance",
         },
