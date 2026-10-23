@@ -113,6 +113,12 @@ def check_close(
         )
 
 
+def fp16_ulp(value: float) -> float:
+    """Spacing between adjacent float16 values at the magnitude of ``value``."""
+    magnitude = max(abs(value), 2.0**-14)  # smallest normal; subnormals share its ULP
+    return 2.0 ** (math.floor(math.log2(magnitude)) - 10)
+
+
 def verify_negative_rejection(
     result: torch.Tensor,
     expected: torch.Tensor,
@@ -124,11 +130,32 @@ def verify_negative_rejection(
 
     Ensures the test suite does not produce false passes when outputs violate
     numerical bounds.
+
+    The check stays in float16 (same dtype path as check_close). The perturbation
+    must survive float16 rounding, so it is sized from the tolerance and the
+    float16 ULP at the largest expected magnitude (both grow with world size):
+
+        perturbation = 2 * atol + 2 * ULP
+
+    Worst case, the result already sits atol away from expected in the opposite
+    direction and rounding loses up to ULP/2, leaving a realized error of at
+    least atol + 1.5 * ULP, which is strictly outside tolerance.
     """
     corrupted = result.clone().flatten()
     flat_expected = expected.flatten()
-    perturbation = (atol + 1.0) if atol > 0.0 else 1.0
+    max_magnitude = max(float(flat_expected.abs().max()), 1.0)
+    perturbation = 2.0 * atol + 2.0 * fp16_ulp(max_magnitude)
     corrupted[0] += perturbation
+
+    # Guard against a vacuous test: the perturbation must remain outside
+    # tolerance after float16 rounding.
+    realized = abs(float(corrupted[0]) - float(flat_expected[0]))
+    if not realized > atol:
+        raise RuntimeError(
+            f"[{comm_rank}] [{test_id}] Negative validation setup invalid: "
+            f"perturbation {perturbation} realized as {realized} <= atol {atol}"
+        )
+
     is_rejected = not torch.allclose(corrupted, flat_expected, atol=atol, rtol=0.0)
     if not is_rejected:
         raise RuntimeError(
