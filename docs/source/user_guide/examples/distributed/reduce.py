@@ -22,13 +22,31 @@ import torch.distributed as dist
 DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
+# spyre-comms picks the reduce algorithm (COLL_REDUCE_ALGO forces one). Most are
+# trees of depth ceil(log2 N); Progressive accumulates one RECV at a time, so its
+# chain of float16 additions is N - 1 deep.
+SEQUENTIAL_ALGOS = frozenset({"Progressive"})
+STICK_ELEMENTS = 64  # 128 B stick / 2 B per float16
+# 262144 float16 = 512 KB, the Offload_AllGatherSum cutoff on x86 (inclusive);
+# 262208 is the first size past it.
+SWEEP_SIZES = (4096, 65536, 262144, 262208)
+
+
+def accumulation_depth(comm_size: int) -> int:
+    """Longest chain of float16 additions for the selected algorithm."""
+    if comm_size <= 1:
+        return 1
+    if os.environ.get("COLL_REDUCE_ALGO") in SEQUENTIAL_ALGOS:
+        return comm_size - 1
+    return math.ceil(math.log2(comm_size))
+
 
 def calculate_reduce_tolerance(comm_size: int, max_expected: float) -> float:
-    """Calculate self-calibrating tolerance for binary tree reduction.
+    """Calculate self-calibrating tolerance for the reduction.
 
-    A balanced binary tree reduction (COMPUTE_TREE in spyre-comms) has depth
-    d = ceil(log2(N)). Each level introduces at most 1 ULP of float16 rounding
-    error at the running partial-sum magnitude.
+    Each level of the addition chain introduces at most 1 ULP of float16 rounding
+    error at the running partial-sum magnitude. The depth d is ceil(log2(N)) for
+    the tree algorithms (COMPUTE_TREE in spyre-comms) and N - 1 for Progressive.
     ULP of float16 at value v is 2^(floor(log2(v)) - 10).
 
     Args:
@@ -36,13 +54,12 @@ def calculate_reduce_tolerance(comm_size: int, max_expected: float) -> float:
         max_expected: Maximum expected value in the reduced tensor
 
     Returns:
-        atol: Absolute tolerance scaled by tree depth and float16 ULP
+        atol: Absolute tolerance scaled by accumulation depth and float16 ULP
     """
     if max_expected <= 0.0:
         return 0.0
-    tree_depth = math.ceil(math.log2(comm_size)) if comm_size > 1 else 1
     ulp = 2.0 ** (math.floor(math.log2(max_expected)) - 10)
-    return tree_depth * ulp
+    return accumulation_depth(comm_size) * ulp
 
 
 def check_close(
@@ -160,6 +177,18 @@ def verify_negative_rejection(
         )
 
 
+def random_rank_ints(num_elements: int, rank: int) -> torch.Tensor:
+    """Deterministic per-rank integers in [0, 512) as int64.
+
+    Every rank can regenerate every other rank's data, so the root builds the
+    reference from the actual inputs. Integers below 512 are exact in float16
+    and DLFloat16, so only the reduction itself rounds, and the reference is
+    the correctly rounded exact sum (no float16 overflow for any size).
+    """
+    gen = torch.Generator().manual_seed(1_234_567 + 7_919 * rank + num_elements)
+    return torch.randint(0, 512, (num_elements,), generator=gen, dtype=torch.int64)
+
+
 def generate_test_tensors(
     test_spec: dict, comm_rank: int, comm_size: int
 ) -> Tuple[torch.Tensor, torch.Tensor, float]:
@@ -251,6 +280,31 @@ def generate_test_tensors(
         else:
             expected_tensor = None
             atol = 0.0
+    elif pattern == "random_ints":
+        input_tensor = random_rank_ints(num_elements, comm_rank).to(torch.float16)
+        input_tensor = input_tensor.reshape(shape)
+        if comm_rank == 0:
+            total = sum(random_rank_ints(num_elements, r) for r in range(comm_size))
+            expected_tensor = total.to(torch.float16).reshape(shape)
+            atol = calculate_reduce_tolerance(comm_size, float(expected_tensor.max()))
+        else:
+            expected_tensor = None
+            atol = 0.0
+
+    elif pattern == "disjoint_shards":
+        if num_elements % comm_size != 0:
+            raise ValueError(
+                f"{num_elements} elements do not split over {comm_size} ranks"
+            )
+        shard = num_elements // comm_size
+        values = (torch.arange(num_elements) % 251 + 1).to(torch.float16)
+        input_tensor = torch.zeros(num_elements, dtype=torch.float16)
+        lo, hi = comm_rank * shard, (comm_rank + 1) * shard
+        input_tensor[lo:hi] = values[lo:hi]
+        input_tensor = input_tensor.reshape(shape)
+        expected_tensor = values.reshape(shape) if comm_rank == 0 else None
+        atol = 0.0
+
     else:
         raise ValueError(f"Unknown test pattern: {pattern}")
 
@@ -270,7 +324,9 @@ def execute_reduce_step(
     return input_device.to("cpu") if comm_rank == 0 else None
 
 
-def get_test_matrix(num_elements: int = 128) -> list:
+def get_test_matrix(
+    num_elements: int = 128, comm_size: int = 1, size_sweep: bool = False
+) -> list:
     """Return the structured test case matrix inspired by torch_nnpa/tests."""
     # Hardware constraints: minimum DMA transfer size = 128 bytes (64 float16 elements).
     # Multi-dimensional splitting requires inner dimension aligned to stick boundary (64 elements).
@@ -278,8 +334,11 @@ def get_test_matrix(num_elements: int = 128) -> list:
     rows_2d = max(2, num_elements // inner_dim)
     d1_3d = 2
     d2_3d = max(2, num_elements // (d1_3d * inner_dim))
+    # Shard-per-rank size: a whole number of sticks per rank.
+    sticks_per_rank = max(1, num_elements // (STICK_ELEMENTS * comm_size))
+    shard_len = STICK_ELEMENTS * comm_size * sticks_per_rank
 
-    return [
+    matrix = [
         # --- Exact Invariant Test Cases (atol=0.0, rtol=0.0) ---
         {
             "id": "EXACT_ZEROS_1D",
@@ -367,21 +426,65 @@ def get_test_matrix(num_elements: int = 128) -> list:
             "pattern": "range",
             "category": "tolerance",
         },
+        # --- One logical tensor spread across ranks (size scales, tensor count doesn't) ---
+        # Each rank owns one disjoint slice; summing with zeros is exact, so any
+        # wrong chunk boundary or offset shows up as a wrong value (atol=0).
+        {
+            "id": "EXACT_DISJOINT_SHARDS",
+            "shape": (shard_len,),
+            "pattern": "disjoint_shards",
+            "category": "exact",
+        },
+        # Inputs are random integers (exact in float16 and DLFloat16) so only the
+        # accumulation rounds. Sizes probe chunk handling in the reduce-scatter
+        # based algorithms: exactly one stick per rank, a non-multiple, and the
+        # smallest legal tensor.
+        {
+            "id": "CHUNK_ONE_STICK_PER_RANK",
+            "shape": (STICK_ELEMENTS * comm_size,),
+            "pattern": "random_ints",
+            "category": "chunking",
+        },
+        {
+            "id": "CHUNK_NON_MULTIPLE",
+            "shape": (STICK_ELEMENTS * (comm_size + 1),),
+            "pattern": "random_ints",
+            "category": "chunking",
+        },
     ]
+    if size_sweep:
+        matrix += [
+            {
+                "id": f"SWEEP_RANDOM_{n}",
+                "shape": (n,),
+                "pattern": "random_ints",
+                "category": "sweep",
+            }
+            for n in SWEEP_SIZES
+        ]
+    return matrix
 
 
-def run_test(comm_rank, comm_size, async_op=False, num_elements=128, test_case="all"):
+def run_test(
+    comm_rank,
+    comm_size,
+    async_op=False,
+    num_elements=128,
+    test_case="all",
+    size_sweep=False,
+):
     """Run reduce test matrix with exact invariant and tolerance verification."""
     global DEVICE
 
     print("=" * 80)
     print(
         f"[{comm_rank} of {comm_size}] Running Reduce Parametrized Test Suite "
-        f"(elements={num_elements}, async={async_op}, filter='{test_case}')"
+        f"(elements={num_elements}, async={async_op}, filter='{test_case}', "
+        f"algo={os.environ.get('COLL_REDUCE_ALGO', 'default')})"
     )
     print("=" * 80)
 
-    test_matrix = get_test_matrix(num_elements)
+    test_matrix = get_test_matrix(num_elements, comm_size, size_sweep)
     passed_count = 0
     total_count = 0
 
@@ -456,7 +559,16 @@ if __name__ == "__main__":
         dest="test_case",
         type=str,
         default="all",
-        help="Specific test case ID, category ('exact', 'tolerance'), pattern ('zeros', 'ones', 'range'), or 'all'",
+        help="Specific test case ID, category ('exact', 'tolerance', 'chunking', 'sweep'), "
+        "pattern ('zeros', 'ones', 'range', 'random_ints', ...), or 'all'",
+    )
+    parser.add_argument(
+        "--size-sweep",
+        dest="size_sweep",
+        action="store_true",
+        default=False,
+        help="Also run large-tensor cases, including sizes either side of the "
+        "512 KB Offload_AllGatherSum cutoff",
     )
     args = parser.parse_args()
 
@@ -484,6 +596,7 @@ if __name__ == "__main__":
         async_op=args.async_op,
         num_elements=args.num_elements,
         test_case=args.test_case,
+        size_sweep=args.size_sweep,
     )
 
     dist.destroy_process_group()
